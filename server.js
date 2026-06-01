@@ -1,115 +1,133 @@
-const WebSocket = require('ws');
+const express = require('express');
 const http = require('http');
-const url = require('url');
+const WebSocket = require('ws');
+const cors = require('cors');
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200, {'Content-Type': 'text/plain'});
-  res.end('WebRTC Signaling Server Running');
-});
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
 
+const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
-const rooms = new Map(); // roomId -> {host, monitor, users: Map}
 
-function log(msg) {
-  console.log(`[${new Date().toISOString()}] ${msg}`);
-}
+const rooms = {};
+const clients = new Map();
 
-function getRoom(roomId) {
-  if (!rooms.has(roomId)) {
-    rooms.set(roomId, {host: null, monitor: null, users: new Map()});
-  }
-  return rooms.get(roomId);
-}
+wss.on('connection', (ws) => {
+  ws.id = Math.random().toString(36).substring(2, 9);
 
-wss.on('connection', (ws, req) => {
-  const params = new URLSearchParams(url.parse(req.url, true).query);
-  ws.roomId = params.get('room') || 'default';
-  ws.role = null;
-  ws.id = null;
-  ws.isAlive = true;
-
-  ws.on('pong', () => ws.isAlive = true);
-
-  ws.on('message', raw => {
+  ws.on('message', (message) => {
     try {
-      const data = JSON.parse(raw);
-      const room = getRoom(ws.roomId);
+      const data = JSON.parse(message);
 
-      if (data.type === 'register') {
+      if (data.type === 'join') {
         ws.role = data.role;
-        ws.id = data.id || Math.random().toString(36).substr(2,9);
+        ws.name = data.name || 'Guest';
+        ws.roomId = data.roomId || 'public';
 
-        if (data.role === 'host') {
-          room.host = ws;
-          log(`Host joined room ${ws.roomId}`);
-        } else if (data.role === 'monitor') {
-          room.monitor = ws;
-          log(`Monitor joined room ${ws.roomId}`);
-        } else if (data.role === 'user') {
-          room.users.set(ws.id, ws);
-          log(`User ${ws.id} joined room ${ws.roomId}`);
-          // Notify host + monitor
-          broadcast(room, {type:'user-joined', userId:ws.id}, [ws]);
+        if (!rooms[ws.roomId]) rooms[ws.roomId] = { host: null, users: {}, monitors: [] };
+
+        if (ws.role === 'host') rooms[ws.roomId].host = ws;
+        if (ws.role === 'user') rooms[ws.roomId].users[ws.id] = ws;
+        if (ws.role === 'monitor') rooms[ws.roomId].monitors.push(ws);
+
+        clients.set(ws.id, ws);
+
+        // Tell host a user joined
+        if (ws.role === 'user' && rooms[ws.roomId].host) {
+          rooms[ws.roomId].host.send(JSON.stringify({
+            type: 'user-joined',
+            userId: ws.id,
+            name: ws.name,
+            roomId: ws.roomId
+          }));
+        }
+
+        // Tell all monitors a user joined
+        rooms[ws.roomId].monitors.forEach(m => {
+          m.send(JSON.stringify({
+            type: 'user-joined',
+            userId: ws.id,
+            name: ws.name
+          }));
+        });
+      }
+
+      // WebRTC signaling
+      if (data.type === 'offer' || data.type === 'answer' || data.type === 'ice') {
+        const target = clients.get(data.target);
+        if (target) {
+          target.send(JSON.stringify({...data, from: ws.id }));
         }
       }
 
-      // Route signaling
-      const target = data.to;
-      if (target === 'host' && room.host && room.host.readyState === WebSocket.OPEN) {
-        room.host.send(raw);
-      } else if (target === 'monitor' && room.monitor && room.monitor.readyState === WebSocket.OPEN) {
-        room.monitor.send(raw);
-      } else if (target === 'all') {
-        if (room.host) room.host.send(raw);
-        if (room.monitor) room.monitor.send(raw);
-      } else if (room.users.has(target)) {
-        room.users.get(target).send(raw);
+      // Host approval
+      if (data.type === 'approve' || data.type === 'reject') {
+        const target = clients.get(data.target);
+        if (target) target.send(JSON.stringify({ type: data.type }));
       }
+
+      // Chat messages - only sent to target user or host
+      if (data.type === 'chat') {
+        if (data.target) {
+          const target = clients.get(data.target);
+          if (target) target.send(JSON.stringify({
+            type: 'chat',
+            from: ws.id,
+            msg: data.msg
+          }));
+        } else {
+          // Group chat in room
+          const room = rooms[ws.roomId];
+          if (room.host) room.host.send(JSON.stringify({
+            type: 'chat',
+            from: ws.id,
+            msg: data.msg
+          }));
+          Object.values(room.users).forEach(u => {
+            if (u.id!== ws.id) u.send(JSON.stringify({
+              type: 'chat',
+              from: ws.id,
+              msg: data.msg
+            }));
+          });
+        }
+      }
+
+      // File/Voice - base64 transfer
+      if (data.type === 'file' || data.type === 'voice') {
+        const room = rooms[ws.roomId];
+        if (room.host) room.host.send(JSON.stringify({
+          type: data.type,
+          from: ws.id,
+          fileName: data.fileName,
+          fileData: data.fileData
+        }));
+      }
+
     } catch (e) {
-      log(`Error parsing message: ${e.message}`);
+      console.log('Error:', e);
     }
   });
 
   ws.on('close', () => {
-    const room = rooms.get(ws.roomId);
-    if (!room) return;
+    clients.delete(ws.id);
+    if (ws.roomId && rooms[ws.roomId]) {
+      delete rooms[ws.roomId].users[ws.id];
+      if (ws.role === 'host') rooms[ws.roomId].host = null;
+      if (ws.role === 'monitor') {
+        rooms[ws.roomId].monitors = rooms[ws.roomId].monitors.filter(m => m.id!== ws.id);
+      }
 
-    if (ws.role === 'host') {
-      room.host = null;
-      broadcast(room, {type:'host-left'});
-      log(`Host left room ${ws.roomId}`);
-    } else if (ws.role === 'monitor') {
-      room.monitor = null;
-      log(`Monitor left room ${ws.roomId}`);
-    } else if (ws.role === 'user') {
-      room.users.delete(ws.id);
-      broadcast(room, {type:'user-left', userId:ws.id});
-      log(`User ${ws.id} left room ${ws.roomId}`);
-    }
-
-    if (!room.host &&!room.monitor && room.users.size === 0) {
-      rooms.delete(ws.roomId);
+      // Notify everyone user left
+      const room = rooms[ws.roomId];
+      if (room.host) room.host.send(JSON.stringify({ type: 'user-left', userId: ws.id }));
+      room.monitors.forEach(m => m.send(JSON.stringify({ type: 'user-left', userId: ws.id })));
     }
   });
-
-  ws.on('error', err => log(`WS Error: ${err.message}`));
 });
 
-// Heartbeat to kill dead connections
-const interval = setInterval(() => {
-  wss.clients.forEach(ws => {
-    if (!ws.isAlive) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, 30000);
+app.get('/', (req, res) => res.send('WebRTC Server Running'));
 
-function broadcast(room, msg, exclude = []) {
-  const str = JSON.stringify(msg);
-  if (room.host &&!exclude.includes(room.host)) room.host.send(str);
-  if (room.monitor &&!exclude.includes(room.monitor)) room.monitor.send(str);
-  room.users.forEach(u => { if (!exclude.includes(u)) u.send(str); });
-}
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => log(`Signaling server running on port ${PORT}`));
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => console.log('Server on port', PORT));
