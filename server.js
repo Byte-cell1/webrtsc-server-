@@ -12,6 +12,7 @@ const wss = new WebSocket.Server({ server });
 
 const rooms = {};
 const clients = new Map();
+const groups = {};
 
 wss.on('connection', (ws) => {
   ws.id = Math.random().toString(36).substring(2, 9);
@@ -33,17 +34,14 @@ wss.on('connection', (ws) => {
 
         clients.set(ws.id, ws);
 
-        // Tell host a user joined
         if (ws.role === 'user' && rooms[ws.roomId].host) {
           rooms[ws.roomId].host.send(JSON.stringify({
             type: 'user-joined',
             userId: ws.id,
-            name: ws.name,
-            roomId: ws.roomId
+            name: ws.name
           }));
         }
 
-        // Tell all monitors a user joined
         rooms[ws.roomId].monitors.forEach(m => {
           m.send(JSON.stringify({
             type: 'user-joined',
@@ -53,60 +51,47 @@ wss.on('connection', (ws) => {
         });
       }
 
-      // WebRTC signaling
       if (data.type === 'offer' || data.type === 'answer' || data.type === 'ice') {
         const target = clients.get(data.target);
-        if (target) {
-          target.send(JSON.stringify({...data, from: ws.id }));
-        }
+        if (target) target.send(JSON.stringify({...data, from: ws.id }));
       }
 
-      // Host approval
       if (data.type === 'approve' || data.type === 'reject') {
         const target = clients.get(data.target);
         if (target) target.send(JSON.stringify({ type: data.type }));
       }
 
-      // Chat messages - only sent to target user or host
       if (data.type === 'chat') {
-        if (data.target) {
-          const target = clients.get(data.target);
-          if (target) target.send(JSON.stringify({
-            type: 'chat',
-            from: ws.id,
-            msg: data.msg
-          }));
-        } else {
-          // Group chat in room
-          const room = rooms[ws.roomId];
-          if (room.host) room.host.send(JSON.stringify({
-            type: 'chat',
-            from: ws.id,
-            msg: data.msg
-          }));
-          Object.values(room.users).forEach(u => {
-            if (u.id!== ws.id) u.send(JSON.stringify({
-              type: 'chat',
-              from: ws.id,
-              msg: data.msg
-            }));
+        if (data.target && data.target.startsWith('g_')) {
+          const group = groups[data.target];
+          group?.members.forEach(uid => {
+            const client = clients.get(uid);
+            if (client) client.send(JSON.stringify({ type: 'chat', from: ws.id, msg: data.msg }));
           });
+        } else if (data.target) {
+          const target = clients.get(data.target);
+          if (target) target.send(JSON.stringify({ type: 'chat', from: ws.id, msg: data.msg }));
+        } else {
+          const room = rooms[ws.roomId];
+          if (room.host) room.host.send(JSON.stringify({ type: 'chat', from: ws.id, msg: data.msg }));
         }
       }
 
-      // File/Voice - base64 transfer
-      if (data.type === 'file' || data.type === 'voice') {
-        const room = rooms[ws.roomId];
-        if (room.host) room.host.send(JSON.stringify({
-          type: data.type,
-          from: ws.id,
-          fileName: data.fileName,
-          fileData: data.fileData
-        }));
+      if (data.type === 'file') {
+        if (data.target && data.target.startsWith('g_')) {
+          const group = groups[data.target];
+          group?.members.forEach(uid => {
+            const client = clients.get(uid);
+            if (client) client.send(JSON.stringify({...data, from: ws.id }));
+          });
+        } else {
+          const target = clients.get(data.target);
+          if (target) target.send(JSON.stringify({...data, from: ws.id }));
+        }
       }
 
     } catch (e) {
-      console.log('Error:', e);
+      console.log('Error:', e.message);
     }
   });
 
@@ -118,8 +103,6 @@ wss.on('connection', (ws) => {
       if (ws.role === 'monitor') {
         rooms[ws.roomId].monitors = rooms[ws.roomId].monitors.filter(m => m.id!== ws.id);
       }
-
-      // Notify everyone user left
       const room = rooms[ws.roomId];
       if (room.host) room.host.send(JSON.stringify({ type: 'user-left', userId: ws.id }));
       room.monitors.forEach(m => m.send(JSON.stringify({ type: 'user-left', userId: ws.id })));
